@@ -26,6 +26,7 @@ juce_add_plugin(BarrelKick
 
 target_sources(BarrelKick PRIVATE
     Source/KickEngine.h
+    Source/Rumble.h
     Source/PluginProcessor.h
     Source/PluginProcessor.cpp
     Source/PluginEditor.h
