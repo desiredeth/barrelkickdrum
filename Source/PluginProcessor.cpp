@@ -50,6 +50,20 @@ Layout BarrelKickProcessor::createLayout()
     addF (l, "distMix",  "Distortion Mix", 0.f, 1.f, 1.f);
     addC (l, "oversample", "Oversampling", { "Off", "2x", "4x" }, 1);
 
+    addF (l, "rumLvl",   "Rumble Level", 0.f, 1.f, 0.5f);
+    addF (l, "rumDecay", "Rumble Decay", 0.3f, 8.f, 2.5f, 2.f, " s");
+    addF (l, "rumSize",  "Rumble Size", 0.5f, 2.f, 1.f);
+    addF (l, "rumDamp",  "Rumble Damping", 200.f, 8000.f, 1500.f, 1500.f, " Hz");
+    addF (l, "rumDrive", "Rumble Drive", 0.f, 30.f, 12.f, -1.f, " dB");
+    addF (l, "rumTone",  "Rumble Tone (LP)", 60.f, 800.f, 180.f, 200.f, " Hz");
+    addF (l, "rumReso",  "Rumble Resonance", 0.5f, 6.f, 1.2f, 1.5f);
+    addF (l, "rumLow",   "Rumble Low Cut", 20.f, 120.f, 30.f, 40.f, " Hz");
+    addF (l, "rumWidth", "Rumble Width", 0.f, 1.f, 0.3f);
+    addF (l, "duckDepth",   "Groove Depth", 0.f, 1.f, 0.9f);
+    addF (l, "duckRelease", "Groove Release", 20.f, 800.f, 250.f, 200.f, " ms");
+    addC (l, "duckSync",    "Groove Sync", { "Free (ms)", "1/16", "1/8", "3/16", "1/4" }, 0);
+    addF (l, "duckCurve",   "Groove Curve", 0.3f, 3.f, 1.f, 1.f);
+
     addF (l, "outGain", "Output", -24.f, 6.f, -3.f, -1.f, " dB");
     return l;
 }
@@ -70,6 +84,10 @@ void BarrelKickProcessor::prepareToPlay (double sr, int)
 {
     engine.prepare (sr);
     mono.setSize (1, 4096);
+    fdn.prepare (sr);
+    for (auto& f : rumbleHP) f.reset();
+    for (auto& f : rumbleLP) f.reset();
+    duckT = 10.f;
     for (int i = 0; i < 2; ++i)
     {
         os[i] = std::make_unique<juce::dsp::Oversampling<float>> (
@@ -128,7 +146,14 @@ void BarrelKickProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
 
     auto renderTo = [&] (int a, int b) { for (int i = a; i < b; ++i) m[i] = engine.process(); };
 
-    if (auditionRequested.exchange (false)) engine.trigger (1.f);
+    numTrig = 0;
+    auto fire = [&] (float v, int at)
+    {
+        engine.trigger (v);
+        if (numTrig < 64) trigPos[numTrig++] = at;
+    };
+
+    if (auditionRequested.exchange (false)) fire (1.f, 0);
 
     int pos = 0;
     for (const auto meta : midi)
@@ -137,7 +162,7 @@ void BarrelKickProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
         const int ep = juce::jlimit (pos, n, meta.samplePosition);
         renderTo (pos, ep);
         pos = ep;
-        if (msg.isNoteOn())                                   engine.trigger (msg.getFloatVelocity());
+        if (msg.isNoteOn())                                   fire (msg.getFloatVelocity(), ep);
         else if (msg.isAllNotesOff() || msg.isAllSoundOff())  engine.kill();
     }
     renderTo (pos, n);
@@ -162,17 +187,62 @@ void BarrelKickProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
         }
     }
 
-    // DC blocker, output gain, safety clip
+    // Rumble + groove (post-distortion send), DC blocker, output gain, safety clip
+    const float sr = (float) getSampleRate();
+    const float dt = 1.f / sr;
+    float bpm = 140.f;
+    if (auto* ph = getPlayHead())
+        if (auto pos = ph->getPosition())
+            if (auto b = pos->getBpm()) bpm = (float) juce::jlimit (30.0, 300.0, *b);
+
+    const float rumLvl   = get ("rumLvl") * 0.4f;     // normalised: 1.0 ~ kick level
+    const float rumDrive = juce::Decibels::decibelsToGain (get ("rumDrive"));
+    const float rumWidth = get ("rumWidth");
+    const float depth    = get ("duckDepth");
+    const float curve    = get ("duckCurve");
+    const int   sync     = (int) get ("duckSync");
+    static const float kBeats[5] = { 0.f, 0.25f, 0.5f, 0.75f, 1.f };
+    const float release  = std::max (0.005f, sync == 0 ? get ("duckRelease") * 0.001f
+                                                        : kBeats[sync] * 60.f / bpm);
+
+    fdn.set (get ("rumSize"), get ("rumDecay"), get ("rumDamp"));
+    for (auto& f : rumbleHP) f.set (get ("rumLow"), sr, 0.707f);
+    for (auto& f : rumbleLP) f.set (get ("rumTone"), sr, get ("rumReso"));
+
+    float* outL = buffer.getWritePointer (0);
+    float* outR = buffer.getNumChannels() > 1 ? buffer.getWritePointer (1) : nullptr;
+    int ti = 0;
+
     for (int i = 0; i < n; ++i)
     {
+        while (ti < numTrig && trigPos[ti] <= i) { duckT = 0.f; ++ti; }
+
         const float x = m[i];
         hpY = x - hpX + 0.9995f * hpY;
         hpX = x;
-        m[i] = juce::jlimit (-1.f, 1.f, hpY * outGain);
-    }
+        const float kick = hpY;
 
-    for (int ch = 0; ch < buffer.getNumChannels(); ++ch)
-        buffer.copyFrom (ch, 0, m, n);
+        float rl, rr, a, b;
+        fdn.process (kick, rl, rr);
+        rumbleHP[0].run (rl, a, b); rl = b;
+        rumbleHP[1].run (rr, a, b); rr = b;
+        rl = std::tanh (rl * rumDrive);
+        rr = std::tanh (rr * rumDrive);
+        rumbleLP[0].run (rl, a, b); rl = a;
+        rumbleLP[1].run (rr, a, b); rr = a;
+
+        float duck = 1.f;
+        if (duckT < release)
+            duck = 1.f - depth * (1.f - std::pow (duckT / release, curve));
+        duckT += dt;
+
+        const float mid = 0.5f * (rl + rr);
+        rl = (mid + rumWidth * (rl - mid)) * rumLvl * duck;
+        rr = (mid + rumWidth * (rr - mid)) * rumLvl * duck;
+
+        outL[i] = juce::jlimit (-1.f, 1.f, (kick + rl) * outGain);
+        if (outR != nullptr) outR[i] = juce::jlimit (-1.f, 1.f, (kick + rr) * outGain);
+    }
 }
 
 juce::AudioProcessorEditor* BarrelKickProcessor::createEditor() { return new BarrelKickEditor (*this); }

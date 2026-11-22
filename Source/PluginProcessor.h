@@ -2,6 +2,7 @@
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <juce_dsp/juce_dsp.h>
 #include "KickEngine.h"
+#include "Rumble.h"
 
 class BarrelKickProcessor : public juce::AudioProcessor
 {
@@ -21,7 +22,7 @@ public:
     bool acceptsMidi() const override { return true; }
     bool producesMidi() const override { return false; }
     bool isMidiEffect() const override { return false; }
-    double getTailLengthSeconds() const override { return 2.0; }
+    double getTailLengthSeconds() const override { return 8.0; }
 
     int getNumPrograms() override { return 1; }
     int getCurrentProgram() override { return 0; }
@@ -50,6 +51,13 @@ private:
     float driveLin = 1.f, distMix = 1.f, outGain = 1.f;
     int   lastOsIdx = 0;
     float hpX = 0.f, hpY = 0.f;
+
+    // Rumble
+    RumbleFDN fdn;
+    SVF rumbleHP[2], rumbleLP[2];
+    float duckT = 10.f;
+    int   trigPos[64] {};
+    int   numTrig = 0;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (BarrelKickProcessor)
 };
